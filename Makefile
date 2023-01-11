@@ -114,6 +114,17 @@ NOVA_BRANCH    ?= master
 NOVA           ?= config/samples/nova_v1beta1_nova.yaml
 NOVA_CR        ?= ${OPERATOR_BASE_DIR}/nova-operator/${NOVA}
 
+
+# Ceph
+CEPH_IMG       ?= quay.io/ceph/ceph:v17
+CEPH_REPO      ?= https://github.com/rook/rook.git
+CEPH_BRANCH    ?= master
+CEPH_CRDS      ?= ${OPERATOR_BASE_DIR}/rook/deploy/examples/crds.yaml
+CEPH_COMMON    ?= ${OPERATOR_BASE_DIR}/rook/deploy/examples/common.yaml
+CEPH_OP        ?= ${OPERATOR_BASE_DIR}/rook/deploy/examples/operator-openshift.yaml
+CEPH_CR        ?= ${OPERATOR_BASE_DIR}/rook/deploy/examples/cluster-test.yaml
+CEPH_CLIENT    ?= ${OPERATOR_BASE_DIR}/rook/deploy/examples/toolbox.yaml
+
 # target vars for generic operator install info 1: target name , 2: operator name
 define vars
 ${1}: export NAMESPACE=${NAMESPACE}
@@ -696,3 +707,53 @@ mariadb_kuttl: namespace input openstack_crds deploy_cleanup mariadb_deploy_prep
 .PHONY: keystone_kuttl
 keystone_kuttl: namespace input openstack_crds deploy_cleanup mariadb mariadb_deploy mariadb_deploy_validate keystone_deploy_prep keystone ## runs kuttl tests for the keystone operator. Installs openstack crds and keystone operators and cleans up previous deployments before running the tests.
 	INSTALL_YAMLS=${INSTALL_YAMLS} kubectl-kuttl test --config ${KEYSTONE_KUTTL_CONF} ${KEYSTONE_KUTTL_DIR}
+
+##@ CEPH
+.PHONY: ceph_prep
+ceph_prep: ## creates the osd on crc and prepares the CRs
+	$(eval $(call vars,$@,ceph))
+	ssh -i ~/.crc/machines/crc/id_ecdsa core@$(shell crc ip) 'sh -s' < scripts/ceph_prepare.sh 'build'
+	mkdir -p ${OPERATOR_BASE_DIR} ${OPERATOR_DIR} ${DEPLOY_DIR}
+	pushd ${OPERATOR_BASE_DIR} && git clone -b ${CEPH_BRANCH} ${CEPH_REPO} && popd
+	cp ${CEPH_CR} ${DEPLOY_DIR}
+	cp ${CEPH_CLIENT} ${DEPLOY_DIR}
+
+.PHONY: ceph
+ceph: namespace ceph_prep ## installs the CRDs and the operator, also runs the prep step.
+	$(eval $(call vars,$@,ceph))
+	# Create the Ceph related CRDs
+	oc apply -f ${CEPH_CRDS}
+	# Apply roles, sa, scc and common resources
+	oc apply -f ${CEPH_COMMON}
+	# Run the rook operator
+	oc apply -f ${CEPH_OP}
+	## Do not deploy any CEPH-CSI
+	oc patch configmap rook-ceph-operator-config --type='merge' -p '{"data": { "ROOK_CSI_ENABLE_RBD": "false", "ROOK_CSI_ENABLE_CEPHFS": "false" }}' -n rook-ceph
+
+.PHONY: ceph_deploy_prep
+ceph_deploy_prep: export IMAGE=${CEPH_IMG}
+ceph_deploy_prep: # ceph_deploy_cleanup ## prepares the CR to install the service based on the service sample
+	$(eval $(call vars,$@,ceph))
+	# Patch the rook-ceph scc to allow using hostnetworking: this simulates an
+	# external ceph cluster
+	oc patch scc rook-ceph --type='merge' -p '{ "allowHostNetwork": true, "allowHostPID": true, "allowHostPorts": true}'
+	bash scripts/gen-ceph-kustomize.sh
+
+.PHONY: ceph_deploy
+ceph_deploy: ceph_deploy_prep ## installs the service instance using kustomize.
+	$(eval $(call vars,$@,ceph))
+	oc kustomize ${DEPLOY_DIR} | oc apply -f -
+	bash scripts/ceph_prepare.sh "is_ready"
+	bash scripts/ceph_prepare.sh "pools"
+	bash scripts/ceph_prepare.sh "secret"
+
+.PHONY: ceph_deploy_cleanup
+ceph_cleanup: ## cleans up the service instance and remove the operator
+	$(eval $(call vars,$@,ceph))
+	oc kustomize ${DEPLOY_DIR} | oc delete --ignore-not-found=true -f -
+	# Remove the operator
+	oc delete --ignore-not-found=true -f ${CEPH_OP}
+	# Delete the rook/ceph related resources
+	rm -Rf ${OPERATOR_BASE_DIR}/rook ${DEPLOY_DIR}
+	# Clean host
+	ssh -i ~/.crc/machines/crc/id_ecdsa core@$(shell crc ip) 'sh -s' < scripts/ceph_prepare.sh 'clean'
