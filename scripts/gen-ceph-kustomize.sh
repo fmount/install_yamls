@@ -40,7 +40,6 @@ cat <<EOF >kustomization.yaml
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-resources:
 - ./cluster-test.yaml
 namespace: rook-ceph
 patches:
@@ -60,7 +59,10 @@ patches:
     - op: replace
       path: /spec/network
       value:
-        provider: host
+        selectors:
+          cluster: rook-ceph/internalapi
+          public: rook-ceph/storage
+        provider: multus
 
 EOF
 
