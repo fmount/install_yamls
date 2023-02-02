@@ -59,11 +59,7 @@ patches:
     - op: replace
       path: /spec/network
       value:
-        selectors:
-          cluster: rook-ceph/internalapi
-          public: rook-ceph/storage
-        provider: multus
-
+        hostNetwork: true
 EOF
 
 kustomization_add_resources

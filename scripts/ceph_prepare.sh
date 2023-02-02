@@ -34,7 +34,6 @@ function build_osd {
     sudo lvcreate -n ceph_lv_data -l +100%FREE ceph_vg
 }
 
-
 function enable_osd_systemd_service {
 
 cat << EOF > /tmp/ceph-osd-losetup.service
@@ -73,7 +72,6 @@ function usage() {
     echo "> $0 clean"
 }
 
-
 function ceph_is_ready {
 
     sleep $DELAY
@@ -101,24 +99,58 @@ function create_pools {
     done
 }
 
+
+function build_caps {
+    local CAPS=""
+    for pool in "${POOLS[@]}"; do
+        caps="allow rwx pool="$pool
+        CAPS+=$caps,
+    done
+    echo "${CAPS::-1}"
+}
+
+function create_key {
+    CEPH_TOOLS=$(oc get pods -l app=rook-ceph-tools -o name)
+    local client=$1
+    local caps
+    local osd_caps
+
+    if [ "${#POOLS[@]}" -eq 0 ]; then
+        osd_caps="allow *"
+    else
+        caps=$(build_caps)
+        osd_caps="allow class-read object_prefix rbd_children, $caps"
+    fi
+    # do not log the key if exists
+    oc rsh ${CEPH_TOOLS} ceph auth get-or-create "$client" mgr "allow rw" mon "allow r" osd "$osd_caps" >/dev/null
+}
+
+
 function create_secret {
 
     SECRET_NAME="$1"
     NAMESPACE="openstack"
+
     CEPH_TOOLS=$(oc get pods -l app=rook-ceph-tools -o name)
+    client="client.openstack"
 
     TEMPDIR=`mktemp -d`
     trap 'rm -rf -- "$TEMPDIR"' EXIT
     echo 'Copying Ceph config files from the container to $TEMPDIR'
     oc rsh $CEPH_TOOLS ceph config generate-minimal-conf > $TEMPDIR/ceph.conf
-    oc rsh $CEPH_TOOLS ceph auth export client.admin > $TEMPDIR/ceph.client.admin.keyring
+    create_key "$client"
+
+    echo 'Copying OpenStack keyring from the container to $TEMPDIR'
+    oc rsh ${CEPH_TOOLS} ceph auth export "$client" -o /etc/ceph/ceph.$client.keyring >/dev/null
+    oc rsync ${CEPH_TOOLS}:/etc/ceph/ceph.$client.keyring $TEMPDIR
     cat $TEMPDIR/ceph.conf
-    cat $TEMPDIR/ceph.client.admin.keyring
+    cat $TEMPDIR/ceph.$client.keyring
 
     echo "Replacing openshift secret $SECRET_NAME"
     oc delete secret "$SECRET_NAME" -n $NAMESPACE 2>/dev/null || true
-    oc create secret generic $SECRET_NAME --from-file=$TEMPDIR/ceph.conf --from-file=$TEMPDIR/ceph.client.admin.keyring -n $NAMESPACE
+    oc create secret generic $SECRET_NAME --from-file=$TEMPDIR/ceph.conf --from-file=$TEMPDIR/ceph.$client.keyring -n $NAMESPACE
 }
+
 
 ## MAIN
 
